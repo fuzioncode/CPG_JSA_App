@@ -18,6 +18,7 @@
     <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
     <InterpreterPath>
     </InterpreterPath>
+    <Environment>GEMINI_API_KEY=AQ.Ab8RN6JgCKxOPIEVDyG5lLWDxEV9gHQexOVvnCRE2lzZ5koFGg</Environment>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>

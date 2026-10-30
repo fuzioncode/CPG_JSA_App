@@ -41,8 +41,21 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# --- API KEY & SECRETS CONFIGURATION ---
-DEFAULT_GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+# --- ROBUST MULTI-SOURCE API KEY RESOLUTION ---
+def get_gemini_api_key():
+    try:
+        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+            key = st.secrets["GEMINI_API_KEY"]
+            if key and key.startswith("AIzaSy"):
+                return key
+    except Exception:
+        pass
+    
+    env_key = os.environ.get("GEMINI_API_KEY", "")
+    if env_key and env_key.startswith("AIzaSy"):
+        return env_key
+        
+    return ""
 
 # Page Configuration for Responsive Mobile / Tablet / Laptop UI
 st.set_page_config(
@@ -103,7 +116,7 @@ SCOPES = ['https://www.googleapis.com/auth/drive.file']
 @st.cache_data(ttl=3600, show_spinner=False)
 def discover_gemini_models(api_key: str):
     fallback_models = ["models/gemini-2.5-flash", "models/gemini-2.0-flash", "models/gemini-1.5-flash"]
-    if not api_key:
+    if not api_key or not api_key.startswith("AIzaSy"):
         return fallback_models[0], fallback_models
 
     try:
@@ -143,7 +156,20 @@ def discover_gemini_models(api_key: str):
     except Exception:
         return fallback_models[0], fallback_models
 
-# --- Helper 0B: Dynamic QR Code URL Builder ---
+# --- Helper 0B: Validate API Key Live ---
+@st.cache_data(ttl=60, show_spinner=False)
+def validate_gemini_key(api_key: str) -> bool:
+    if not api_key or not api_key.startswith("AIzaSy"):
+        return False
+    try:
+        client = genai.Client(api_key=api_key)
+        # Quick lightweight test call to verify authentication
+        client.models.list()
+        return True
+    except Exception:
+        return False
+
+# --- Helper 0C: Dynamic QR Code URL Builder ---
 def get_active_app_url():
     if is_streamlit_cloud:
         return "https://cpg-jsa-app.streamlit.app/?action=sign"
@@ -395,23 +421,39 @@ with tab_brief:
             key="briefing_textarea"
         )
 
-    gemini_key = os.environ.get("GEMINI_API_KEY", DEFAULT_GEMINI_API_KEY)
-    best_model, available_models = discover_gemini_models(gemini_key)
+    # --- Live API Key Resolution & Validation ---
+    resolved_api_key = get_gemini_api_key()
+    
+    with st.expander("🔑 API Key & Model Configuration", expanded=not bool(resolved_api_key)):
+        user_entered_key = st.text_input("Gemini API Key (AIzaSy...):", value=resolved_api_key, type="password", key="gemini_key_input", placeholder="Paste your AIzaSy... API key here")
+        
+        # Use user input if provided, otherwise fallback to resolved
+        active_key = user_entered_key if user_entered_key.strip() else resolved_api_key
+        
+        # Validate the active key live
+        is_valid_key = validate_gemini_key(active_key)
+        
+        if is_valid_key:
+            st.success("✅ Gemini API Key is valid and authenticated!")
+            best_model, available_models = discover_gemini_models(active_key)
+            selected_model = st.selectbox(
+                "Active Gemini Model (Newest Auto-Selected):",
+                options=available_models,
+                index=0,
+                key="gemini_model_select"
+            )
+        else:
+            st.warning("⚠️ Please enter a valid Gemini API Key starting with **`AIzaSy...`** to enable AI processing.")
+            selected_model = "models/gemini-2.5-flash"
 
-    with st.expander(f"🔑 API Key & Auto-Selected Model ({best_model})", expanded=False):
-        gemini_key = st.text_input("Gemini API Key:", value=gemini_key, type="password", key="gemini_key_input")
-        selected_model = st.selectbox(
-            "Active Gemini Model (Newest Auto-Selected):",
-            options=available_models,
-            index=0,
-            key="gemini_model_select"
-        )
+    # Button is disabled unless a valid key is confirmed
+    process_clicked = st.button("⚡ Process Briefing with AI", key="process_ai_btn", disabled=not is_valid_key)
 
-    if st.button("⚡ Process Briefing with AI", key="process_ai_btn"):
-        if not gemini_key:
+    if process_clicked:
+        if not active_key:
             st.error("Please enter a valid Gemini API Key.")
         else:
-            client = genai.Client(api_key=gemini_key)
+            client = genai.Client(api_key=active_key)
             
             system_instruction = """
             You are a critical infrastructure safety engineer for CPG Beyond at QTS Data Centers.
