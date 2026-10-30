@@ -2,7 +2,6 @@ import sys
 import os
 
 # --- SMART DUAL-ENVIRONMENT BOOTSTRAPPER ---
-# Detects if running on Streamlit Cloud vs Local Visual Studio (F5)
 is_streamlit_cloud = os.path.exists("/mount") or os.environ.get("STREAMLIT_SHARING_MODE") == "true"
 
 if not is_streamlit_cloud and __name__ == "__main__":
@@ -42,8 +41,8 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# --- EMBEDDED API KEY ---
-DEFAULT_GEMINI_API_KEY = "AQ.Ab8RN6Iuovvp5DMV6uXqAXafxOdMseMjXbH9Qmy7J1IjOUCoIQ"
+# --- API KEY & SECRETS CONFIGURATION ---
+DEFAULT_GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
 # Page Configuration for Responsive Mobile / Tablet / Laptop UI
 st.set_page_config(
