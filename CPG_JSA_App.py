@@ -46,13 +46,13 @@ def get_gemini_api_key():
     try:
         if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
             key = st.secrets["GEMINI_API_KEY"]
-            if key and key.startswith("AIzaSy"):
+            if key and key.startswith("A"):
                 return key
     except Exception:
         pass
     
     env_key = os.environ.get("GEMINI_API_KEY", "")
-    if env_key and env_key.startswith("AIzaSy"):
+    if env_key and env_key.startswith("A"):
         return env_key
         
     return ""
