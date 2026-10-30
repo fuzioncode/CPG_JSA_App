@@ -22,6 +22,7 @@ import re
 import json
 import socket
 import datetime
+import urllib.parse
 import qrcode
 import streamlit as st
 from PIL import Image
@@ -41,7 +42,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# --- ROBUST MULTI-SOURCE API KEY RESOLUTION (Supports AQ. and AIzaSy) ---
+# --- ROBUST MULTI-SOURCE API KEY RESOLUTION ---
 def get_gemini_api_key():
     try:
         if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
@@ -168,18 +169,61 @@ def validate_gemini_key(api_key: str) -> bool:
     except Exception:
         return False
 
-# --- Helper 0C: Dynamic QR Code URL Builder ---
-def get_active_app_url():
+# --- Helper 0C: Unique Lead-Specific QR Code URL Builder ---
+def get_active_app_url(lead_name, location_str):
+    lead_slug = urllib.parse.quote(lead_name.strip().replace(" ", "_"))
+    loc_slug = urllib.parse.quote(location_str.strip().replace(" ", "_"))
+    
     if is_streamlit_cloud:
-        return "https://cpg-jsa-app.streamlit.app/?action=sign"
+        base = "https://cpgjsaapp.streamlit.app"
+    else:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            base = f"http://{ip}:8501"
+        except Exception:
+            base = "http://localhost:8501"
+            
+    return f"{base}/?lead={lead_slug}&loc={loc_slug}&action=sign"
+
+# --- Helper 0D: Cross-Device Persistent Storage for Sign-Offs ---
+def get_storage_filenames(lead_name, location_str):
+    lead_slug = re.sub(r'[^A-Za-z0-9_-]', '_', lead_name.strip())
+    loc_slug = re.sub(r'[^A-Za-z0-9_-]', '_', location_str.strip())
+    return f"jsa_data_{lead_slug}_{loc_slug}.json", f"signers_data_{lead_slug}_{loc_slug}.json"
+
+def save_persistent_state(lead_name, location_str, jsa_data, signers_data):
+    jsa_fn, sig_fn = get_storage_filenames(lead_name, location_str)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return f"http://{ip}:8501/?action=sign"
+        with open(jsa_fn, "w") as f:
+            json.dump(jsa_data, f)
+        with open(sig_fn, "w") as f:
+            json.dump(signers_data, f)
     except Exception:
-        return "http://localhost:8501/?action=sign"
+        pass
+
+def load_persistent_state(lead_name, location_str, default_jsa, default_signers):
+    jsa_fn, sig_fn = get_storage_filenames(lead_name, location_str)
+    jsa_data = default_jsa
+    signers_data = default_signers
+    
+    if os.path.exists(jsa_fn):
+        try:
+            with open(jsa_fn, "r") as f:
+                jsa_data = json.load(f)
+        except Exception:
+            pass
+            
+    if os.path.exists(sig_fn):
+        try:
+            with open(sig_fn, "r") as f:
+                signers_data = json.load(f)
+        except Exception:
+            pass
+            
+    return jsa_data, signers_data
 
 # --- Helper 1: Google Drive Sync ---
 def get_drive_service():
@@ -238,7 +282,7 @@ def generate_cpg_pdf(data, signers):
     table_cell = ParagraphStyle('Cell', parent=styles['Normal'], fontSize=8, leading=10)
 
     elements = [
-        Paragraph(f"<b>CPG Job Safety Analysis</b> — {group_name} / Power / HVAC (rev 1.1)", title_style),
+        Paragraph(f"<b>CPG Job Safety Analysis</b> — {group_name} (rev 1.1)", title_style),
         Spacer(1, 6),
     ]
 
@@ -309,36 +353,50 @@ def generate_cpg_pdf(data, signers):
     buffer.seek(0)
     return buffer.getvalue()
 
-# --- Initialize Session State ---
-if 'jsa' not in st.session_state:
-    st.session_state.jsa = {
-        "date": datetime.date.today().strftime("%m/%d/%Y"),
-        "customer": "QTS Data Centers",
-        "sales_order": "24-16119",
-        "location": "SLC Eagle Mountain - DC-02 PDU Gallery",
-        "lead": "Wes Johnson",
-        "group_type": "SWITCHGEAR",
-        "role_title": "Level 4 EPS Lead",
-        "site_contact": "QTS Facilities / Commissioning Lead",
-        "muster_point": "North Parking Lot Primary Rally Point",
-        "task": "480V LV Switchgear Secondary Injection Testing & Visual Inspection",
-        "ladders_used": False,
-        "ladder_reason": "N/A - Working at floor level",
-        "heavy_lifting_lbs": "50 lbs (Secondary Injection Test Kit)",
-        "loto_required": True,
-        "work_env_mode": "De-Energized via LOTO",
-        "voltage": "480V",
-        "arc_flash_ppe": "8-12 Cal/cm² Daily FR",
-        "glove_class": "Class 0 (1000V) with leather protectors",
-        "ppe": ["Hi-Viz Vest", "Safety-Toed Boots", "Safety Glasses", "Hard Hat", "Cut Resistant Gloves"],
-        "steps": [
-            {"step": "Verify LOTO & Zero Energy State", "hazards": "Electrical shock, backfeed, arc flash", "controls": "Live-dead-live test with calibrated meter, personal locks applied"},
-            {"step": "Rack breaker to Test/Disconnected", "hazards": "Pinch points, physical strain, gear binding", "controls": "Hand placement clear of tracks, use breaker lift cart"},
-            {"step": "Secondary Injection & Timing Test", "hazards": "Secondary shock, trip unit burn, arc flash", "controls": "Class 0 gloves, insulated probes, verify wiring diagrams"}
-        ]
-    }
-if 'signers' not in st.session_state:
-    st.session_state.signers = [{"name": f"{st.session_state.jsa['lead']} ({st.session_state.jsa['group_type']} Lead)", "type": "Lead Verification", "time": datetime.datetime.now().strftime("%H:%M:%S")}]
+# --- Initialize Isolated Session State per Lead/Team via Disk Persistence ---
+query_params = st.query_params
+url_lead = query_params.get("lead", "Wes_Johnson").replace("_", " ")
+url_loc = query_params.get("loc", "SLC Eagle Mountain - DC-02 PDU Gallery").replace("_", " ")
+
+default_jsa_dict = {
+    "date": datetime.date.today().strftime("%m/%d/%Y"),
+    "customer": "QTS Data Centers",
+    "sales_order": "24-16119",
+    "location": url_loc,
+    "lead": url_lead,
+    "group_type": "SWITCHGEAR",
+    "role_title": "Level 4 EPS Lead",
+    "site_contact": "QTS Facilities / Commissioning Lead",
+    "muster_point": "North Parking Lot Primary Rally Point",
+    "task": "480V LV Switchgear Secondary Injection Testing & Visual Inspection",
+    "ladders_used": False,
+    "ladder_reason": "N/A - Working at floor level",
+    "heavy_lifting_lbs": "50 lbs (Secondary Injection Test Kit)",
+    "loto_required": True,
+    "work_env_mode": "De-Energized via LOTO",
+    "voltage": "480V",
+    "arc_flash_ppe": "8-12 Cal/cm² Daily FR",
+    "glove_class": "Class 0 (1000V) with leather protectors",
+    "ppe": ["Hi-Viz Vest", "Safety-Toed Boots", "Safety Glasses", "Hard Hat", "Cut Resistant Gloves"],
+    "steps": [
+        {"step": "Verify LOTO & Zero Energy State", "hazards": "Electrical shock, backfeed, arc flash", "controls": "Live-dead-live test with calibrated meter, personal locks applied"},
+        {"step": "Rack breaker to Test/Disconnected", "hazards": "Pinch points, physical strain, gear binding", "controls": "Hand placement clear of tracks, use breaker lift cart"},
+        {"step": "Secondary Injection & Timing Test", "hazards": "Secondary shock, trip unit burn, arc flash", "controls": "Class 0 gloves, insulated probes, verify wiring diagrams"}
+    ]
+}
+
+default_signers_list = [{"name": f"{url_lead} (SWITCHGEAR Lead)", "type": "Lead Verification", "time": datetime.datetime.now().strftime("%H:%M:%S")}]
+
+session_key = f"jsa_{url_lead}_{url_loc}"
+signers_key = f"signers_{url_lead}_{url_loc}"
+
+if session_key not in st.session_state or signers_key not in st.session_state:
+    loaded_jsa, loaded_signers = load_persistent_state(url_lead, url_loc, default_jsa_dict, default_signers_list)
+    st.session_state[session_key] = loaded_jsa
+    st.session_state[signers_key] = loaded_signers
+
+current_jsa = st.session_state[session_key]
+current_signers = st.session_state[signers_key]
 
 # --- UI Header & Editable First Page Status Card ---
 st.title("⚡ CPG Field Lead JSA Assistant")
@@ -346,25 +404,31 @@ st.title("⚡ CPG Field Lead JSA Assistant")
 with st.expander("✏️ Edit Header & Site Info (Active Site, Lead, Group)", expanded=False):
     h_c1, h_c2, h_c3, h_c4 = st.columns(4)
     with h_c1:
-        st.session_state.jsa['location'] = st.text_input("Active Site / Location", value=str(st.session_state.jsa.get('location', '')), key="hdr_loc")
+        current_jsa['location'] = st.text_input("Active Site / Location", value=str(current_jsa.get('location', '')), key="hdr_loc")
     with h_c2:
-        st.session_state.jsa['lead'] = st.text_input("Lead Name", value=str(st.session_state.jsa.get('lead', '')), key="hdr_lead")
+        current_jsa['lead'] = st.text_input("Lead Name", value=str(current_jsa.get('lead', '')), key="hdr_lead")
     with h_c3:
-        st.session_state.jsa['group_type'] = st.selectbox("Group / Specialty", options=["SWITCHGEAR", "POWER", "HVAC", "SOLAR", "GENERATOR"], index=0, key="hdr_group")
+        current_jsa['group_type'] = st.selectbox("Group / Specialty", options=["SWITCHGEAR", "POWER", "HVAC", "SOLAR", "GENERATOR"], index=0, key="hdr_group")
     with h_c4:
-        st.session_state.jsa['role_title'] = st.text_input("Role Title", value=str(st.session_state.jsa.get('role_title', 'Level 4 EPS Lead')), key="hdr_role")
+        current_jsa['role_title'] = st.text_input("Role Title", value=str(current_jsa.get('role_title', 'Level 4 EPS Lead')), key="hdr_role")
+    
+    if st.button("💾 Save Header Updates"):
+        save_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
+        st.success("Header updated and saved!")
 
 st.markdown(
-    f'<div class="status-card"><b>Active Site:</b> {st.session_state.jsa.get("location", "")} &nbsp;|&nbsp; '
-    f'<b>Lead:</b> {st.session_state.jsa.get("lead", "")} &nbsp;|&nbsp; '
-    f'<b>Group:</b> {st.session_state.jsa.get("group_type", "SWITCHGEAR")} &nbsp;|&nbsp; '
-    f'<b>Role:</b> {st.session_state.jsa.get("role_title", "")}</div>',
+    f'<div class="status-card"><b>Active Site:</b> {current_jsa.get("location", "")} &nbsp;|&nbsp; '
+    f'<b>Lead:</b> {current_jsa.get("lead", "")} &nbsp;|&nbsp; '
+    f'<b>Group:</b> {current_jsa.get("group_type", "SWITCHGEAR")} &nbsp;|&nbsp; '
+    f'<b>Role:</b> {current_jsa.get("role_title", "")}</div>',
     unsafe_allow_html=True
 )
 
-query_params = st.query_params
 if query_params.get("action") == "sign":
-    st.info("📲 **Mobile Crew Sign-Off Mode Active** — Please review the scope in Tab 2 and sign off in Tab 3.")
+    st.info("📲 **Mobile Crew Sign-Off Mode Active** — You have opened the briefing sign-off portal. Review the scope in Tab 2 if needed and sign below.")
+
+# Smart Tab Selection: If scanned via QR code (?action=sign), automatically default to Tab 3 (Crew Sign)
+default_tab_index = 2 if query_params.get("action") == "sign" else 0
 
 tab_brief, tab_review, tab_sign, tab_export = st.tabs(["🎙️ 1. Voice Briefing", "📝 2. Review JSA", "✍️ 3. QR / Crew Sign", "🚀 4. Drive Sync"])
 
@@ -420,7 +484,6 @@ with tab_brief:
             key="briefing_textarea"
         )
 
-    # --- Live API Key Resolution & Validation (Supporting AQ. keys) ---
     resolved_api_key = get_gemini_api_key()
     
     with st.expander("🔑 API Key & Model Configuration", expanded=not bool(resolved_api_key)):
@@ -490,7 +553,8 @@ with tab_brief:
                     clean_json = response.text.replace("```json", "").replace("```", "").strip()
                     parsed = json.loads(clean_json)
                     if isinstance(parsed, dict):
-                        st.session_state.jsa.update(parsed)
+                        current_jsa.update(parsed)
+                    save_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
                     st.success(f"✅ CPG JSA Auto-Populated using `{selected_model}`! Proceed to Tab 2 (Review JSA).")
                 except Exception as err:
                     st.error(f"Extraction failed using {selected_model}: {err}")
@@ -501,27 +565,27 @@ with tab_review:
 
     r_col1, r_col2, r_col3 = st.columns(3)
     with r_col1:
-        st.session_state.jsa['lead'] = st.text_input("Onsite Job Lead", value=str(st.session_state.jsa.get('lead', '')), key="rev_lead")
-        st.session_state.jsa['location'] = st.text_input("Location / Gallery", value=str(st.session_state.jsa.get('location', '')), key="rev_loc")
-        st.session_state.jsa['sales_order'] = st.text_input("Sales Order #", value=str(st.session_state.jsa.get('sales_order', '')), key="rev_so")
-        st.session_state.jsa['site_contact'] = st.text_input("Site Contact", value=str(st.session_state.jsa.get('site_contact', '')), key="rev_contact")
-        st.session_state.jsa['muster_point'] = st.text_input("Muster Point", value=str(st.session_state.jsa.get('muster_point', '')), key="rev_muster")
+        current_jsa['lead'] = st.text_input("Onsite Job Lead", value=str(current_jsa.get('lead', '')), key="rev_lead")
+        current_jsa['location'] = st.text_input("Location / Gallery", value=str(current_jsa.get('location', '')), key="rev_loc")
+        current_jsa['sales_order'] = st.text_input("Sales Order #", value=str(current_jsa.get('sales_order', '')), key="rev_so")
+        current_jsa['site_contact'] = st.text_input("Site Contact", value=str(current_jsa.get('site_contact', '')), key="rev_contact")
+        current_jsa['muster_point'] = st.text_input("Muster Point", value=str(current_jsa.get('muster_point', '')), key="rev_muster")
     with r_col2:
-        st.session_state.jsa['task'] = st.text_area("Task Description Summary", value=str(st.session_state.jsa.get('task', '')), height=108, key="rev_task")
-        st.session_state.jsa['ladders_used'] = st.checkbox("Using Ladders (Sec 4: Ladders Last)", value=bool(st.session_state.jsa.get('ladders_used', False)), key="rev_ladder_chk")
-        st.session_state.jsa['ladder_reason'] = st.text_input("Why lifts/scaffolds can't be used:", value=str(st.session_state.jsa.get('ladder_reason', '')), key="rev_ladder_reason")
-        st.session_state.jsa['heavy_lifting_lbs'] = st.text_input("Ergonomics / Heavy Lifting (lbs)", value=str(st.session_state.jsa.get('heavy_lifting_lbs', '')), key="rev_lift")
+        current_jsa['task'] = st.text_area("Task Description Summary", value=str(current_jsa.get('task', '')), height=108, key="rev_task")
+        current_jsa['ladders_used'] = st.checkbox("Using Ladders (Sec 4: Ladders Last)", value=bool(current_jsa.get('ladders_used', False)), key="rev_ladder_chk")
+        current_jsa['ladder_reason'] = st.text_input("Why lifts/scaffolds can't be used:", value=str(current_jsa.get('ladder_reason', '')), key="rev_ladder_reason")
+        current_jsa['heavy_lifting_lbs'] = st.text_input("Ergonomics / Heavy Lifting (lbs)", value=str(current_jsa.get('heavy_lifting_lbs', '')), key="rev_lift")
     with r_col3:
-        st.session_state.jsa['voltage'] = st.text_input("Nominal System Voltage", value=str(st.session_state.jsa.get('voltage', '')), key="rev_volt")
-        st.session_state.jsa['work_env_mode'] = st.text_input("Electrical Working Environment", value=str(st.session_state.jsa.get('work_env_mode', '')), key="rev_env")
-        st.session_state.jsa['loto_required'] = st.checkbox("LOTO Established (Zero Energy State)", value=bool(st.session_state.jsa.get('loto_required', True)), key="rev_loto_chk")
-        st.session_state.jsa['arc_flash_ppe'] = st.text_input("Arc Flash PPE Rating", value=str(st.session_state.jsa.get('arc_flash_ppe', '')), key="rev_arc")
-        st.session_state.jsa['glove_class'] = st.text_input("Electrical Glove Class", value=str(st.session_state.jsa.get('glove_class', '')), key="rev_glove")
+        current_jsa['voltage'] = st.text_input("Nominal System Voltage", value=str(current_jsa.get('voltage', '')), key="rev_volt")
+        current_jsa['work_env_mode'] = st.text_input("Electrical Working Environment", value=str(current_jsa.get('work_env_mode', '')), key="rev_env")
+        current_jsa['loto_required'] = st.checkbox("LOTO Established (Zero Energy State)", value=bool(current_jsa.get('loto_required', True)), key="rev_loto_chk")
+        current_jsa['arc_flash_ppe'] = st.text_input("Arc Flash PPE Rating", value=str(current_jsa.get('arc_flash_ppe', '')), key="rev_arc")
+        current_jsa['glove_class'] = st.text_input("Electrical Glove Class", value=str(current_jsa.get('glove_class', '')), key="rev_glove")
     
     with st.expander("✏️ Edit AI-Parsed Hazard Steps (Section 7)", expanded=True):
         st.caption("Modify any step, hazard, or control below if Gemini parsed it incorrectly:")
         updated_steps = []
-        steps_data = st.session_state.jsa.get('steps', [])
+        steps_data = current_jsa.get('steps', [])
         for idx, s in enumerate(steps_data):
             st.markdown(f"**Task Step {idx+1}**")
             s_col1, s_col2, s_col3 = st.columns([1.2, 1.4, 1.4])
@@ -533,25 +597,39 @@ with tab_review:
                 control_text = st.text_input(f"Controls {idx+1}", value=str(s.get('controls', '') if isinstance(s, dict) else ''), key=f"edit_ctrl_{idx}")
             updated_steps.append({"step": step_text, "hazards": hazard_text, "controls": control_text})
             st.markdown("---")
-        st.session_state.jsa['steps'] = updated_steps
+        current_jsa['steps'] = updated_steps
+    
+    if st.button("💾 Save JSA Review Edits"):
+        save_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
+        st.success("JSA changes saved successfully!")
 
 with tab_sign:
     st.markdown("### Section 12: Crew Acknowledgement")
     
-    st.markdown("#### Option A: Quick Sign-In via Dynamic QR Code")
-    app_url = get_active_app_url()
-    qr = qrcode.QRCode(box_size=4, border=2)
-    qr.add_data(app_url)
-    qr.make(fit=True)
-    img_qr = qr.make_image(fill_color="black", back_color="white")
-    
-    q_col1, q_col2 = st.columns([1, 2])
-    with q_col1:
+    col_qr1, col_qr2 = st.columns([1, 2])
+    with col_qr1:
+        app_url = get_active_app_url(current_jsa.get('lead', 'Wes Johnson'), current_jsa.get('location', 'Site'))
+        qr = qrcode.QRCode(box_size=4, border=2)
+        qr.add_data(app_url)
+        qr.make(fit=True)
+        img_qr = qr.make_image(fill_color="black", back_color="white")
         st.image(img_qr.get_image(), caption="Scan to sign on phone", width=180)
-    with q_col2:
-        st.info(f"**QR URL:** `{app_url}`\n\nScan this QR code with a mobile phone camera to open this active safety briefing and submit crew sign-offs remotely.")
+    with col_qr2:
+        st.info(f"**Unique QR URL:** `{app_url}`\n\nTechnicians scanning this QR code are taken directly to this signing portal. Crew signatures submitted on phones sync live here.")
 
-    st.markdown("#### Option B: Sign Directly (Badge ID / Initials or Voice Approval)")
+    st.markdown("---")
+    st.markdown("#### Live Crew Sign-Off Status")
+    
+    # Refresh button so lead can pull newly signed crew records from disk
+    if st.button("🔄 Refresh Crew Signatures List"):
+        _, fresh_signers = load_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
+        st.session_state[signers_key] = fresh_signers
+        current_signers = fresh_signers
+        st.success("Signatures refreshed from live crew submissions!")
+
+    st.table(current_signers)
+
+    st.markdown("#### Submit Sign-Off (Direct or Mobile Device Entry)")
     s_col1, s_col2 = st.columns([1, 1])
     with s_col1:
         crew_name = st.text_input("Technician Full Name", placeholder="e.g. John Doe", key="sign_crew_name")
@@ -578,20 +656,26 @@ with tab_sign:
                 meta_info = f"Badge: {badge_id or 'N/A'} | Initials: {sig_initials or 'N/A'}"
             else:
                 meta_info = "Verbal Sign-Off (Recorded)"
-            st.session_state.signers.append({"name": crew_name.strip(), "type": meta_info, "time": timestamp})
-            st.success(f"Added {crew_name} to JSA roster at {timestamp}!")
+            
+            # Prevent duplicate sign-ins by name
+            if not any(s['name'] == crew_name.strip() for s in current_signers):
+                current_signers.append({"name": crew_name.strip(), "type": meta_info, "time": timestamp})
+                save_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
+                st.success(f"Added {crew_name} to JSA roster at {timestamp}! The lead can now view your signature.")
+            else:
+                st.warning(f"{crew_name.strip()} is already signed in on this JSA roster.")
         else:
             st.warning("Please enter technician's name.")
-
-    st.markdown("#### Verified Crew Signatures")
-    st.table(st.session_state.signers)
 
 with tab_export:
     st.markdown("### Generate PDF & Sync to Google Drive")
     st.write("Target Folder: `My Drive > CPG > Salt Lake City > QTS > JSA`")
 
-    pdf_bytes = generate_cpg_pdf(st.session_state.jsa, st.session_state.signers)
-    safe_loc = re.sub(r'[^A-Za-z0-9_-]', '_', str(st.session_state.jsa.get('location', 'Site')))
+    # Quick review banner of signatures before exporting
+    st.markdown(f"**Current Signed Crew Roster Count:** {len(current_signers)} technicians acknowledged.")
+    
+    pdf_bytes = generate_cpg_pdf(current_jsa, current_signers)
+    safe_loc = re.sub(r'[^A-Za-z0-9_-]', '_', str(current_jsa.get('location', 'Site')))
     filename = f"JSA_QTS_{datetime.date.today().strftime('%Y%m%d')}_{safe_loc}.pdf"
 
     d_col1, d_col2 = st.columns(2)
