@@ -1,14 +1,22 @@
 import sys
 import os
 
-# --- AUTO-BOOTSTRAP LOCAL VS STUDIO RUNNER ---
-if __name__ == "__main__" and "STREAMLIT_SERVER" not in os.environ:
-    if not os.environ.get("STREAMLIT_RUNNING_SUBPROCESS"):
-        import subprocess
-        env = os.environ.copy()
-        env["STREAMLIT_RUNNING_SUBPROCESS"] = "1"
-        cmd = [sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__), "--server.port", "8501"]
-        sys.exit(subprocess.call(cmd, env=env))
+# --- SMART DUAL-ENVIRONMENT BOOTSTRAPPER ---
+# Detects if running on Streamlit Cloud vs Local Visual Studio (F5)
+is_streamlit_cloud = os.path.exists("/mount") or os.environ.get("STREAMLIT_SHARING_MODE") == "true"
+
+if not is_streamlit_cloud and __name__ == "__main__":
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            if not os.environ.get("STREAMLIT_RUNNING_SUBPROCESS"):
+                import subprocess
+                env = os.environ.copy()
+                env["STREAMLIT_RUNNING_SUBPROCESS"] = "1"
+                cmd = [sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__), "--server.port", "8501"]
+                sys.exit(subprocess.call(cmd, env=env))
+    except ImportError:
+        pass
 
 import io
 import re
@@ -136,19 +144,18 @@ def discover_gemini_models(api_key: str):
     except Exception:
         return fallback_models[0], fallback_models
 
-# --- Helper 0B: Get Public or Local URL for QR Code ---
-def get_app_url():
+# --- Helper 0B: Dynamic QR Code URL Builder ---
+def get_active_app_url():
+    if is_streamlit_cloud:
+        return "https://cpg-jsa-app.streamlit.app/?action=sign"
     try:
-        # Check if running on Streamlit Community Cloud or custom domain via headers
-        base_url = st.get_option("server.baseUrlPath") or ""
-        # Default local fallback
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return f"http://{ip}:8501"
+        return f"http://{ip}:8501/?action=sign"
     except Exception:
-        return "http://localhost:8501"
+        return "http://localhost:8501/?action=sign"
 
 # --- Helper 1: Google Drive Sync ---
 def get_drive_service():
@@ -496,10 +503,9 @@ with tab_sign:
     st.markdown("### Section 12: Crew Acknowledgement")
     
     st.markdown("#### Option A: Quick Sign-In via Dynamic QR Code")
-    base_url = "https://share.streamlit.io" # Will auto-resolve to your public cloud URL when hosted
-    network_url = f"http://192.168.1.150:8501/?action=sign"
+    app_url = get_active_app_url()
     qr = qrcode.QRCode(box_size=4, border=2)
-    qr.add_data(network_url)
+    qr.add_data(app_url)
     qr.make(fit=True)
     img_qr = qr.make_image(fill_color="black", back_color="white")
     
@@ -507,7 +513,7 @@ with tab_sign:
     with q_col1:
         st.image(img_qr.get_image(), caption="Scan to sign on phone", width=180)
     with q_col2:
-        st.info("Scan this QR code with a mobile phone camera to open this active safety briefing and submit crew sign-offs remotely.")
+        st.info(f"**QR URL:** `{app_url}`\n\nScan this QR code with a mobile phone camera to open this active safety briefing and submit crew sign-offs remotely.")
 
     st.markdown("#### Option B: Sign Directly (Badge ID / Initials or Voice Approval)")
     s_col1, s_col2 = st.columns([1, 1])
