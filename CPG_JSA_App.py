@@ -123,12 +123,10 @@ st.markdown("""
 
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# --- Feature 4: Dynamic Geocoded Weather & Site Risk Integration ---
+# --- Dynamic Geocoded Weather & Site Risk Integration ---
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_dynamic_site_weather(location_string):
-    """Automatically extracts city/region from location string and fetches live weather conditions."""
     try:
-        # Simple extraction heuristic for cities in location strings (e.g., 'Ashburn', 'Eagle Mountain', 'Chicago', 'Dallas', 'Phoenix')
         known_cities = ["ashburn", "eagle mountain", "chicago", "dallas", "phoenix", "santa clara", "atlanta", "salt lake city", "las vegas", "seattle"]
         query_city = "Eagle Mountain, UT"
         
@@ -150,7 +148,6 @@ def fetch_dynamic_site_weather(location_string):
             wind_mph = current['windspeedMiles']
             humidity = current['humidity']
             
-            # Smart site risk assessment based on live conditions
             risk_note = "Standard Indoor/Gallery Climate"
             try:
                 if float(temp_f) > 90:
@@ -257,8 +254,19 @@ def save_persistent_state(lead_name, location_str, jsa_data, signers_data):
     except Exception:
         pass
 
-def load_persistent_state(lead_name, location_str, default_jsa, default_signers):
+def load_persistent_state(lead_name, location_str, default_jsa, default_signers, force_fresh=False):
     jsa_fn, sig_fn = get_storage_filenames(lead_name, location_str)
+    
+    if force_fresh:
+        try:
+            if os.path.exists(jsa_fn):
+                os.remove(jsa_fn)
+            if os.path.exists(sig_fn):
+                os.remove(sig_fn)
+        except Exception:
+            pass
+        return default_jsa, default_signers
+
     jsa_data = default_jsa
     signers_data = default_signers
     
@@ -451,23 +459,40 @@ if session_key not in st.session_state or signers_key not in st.session_state:
 current_jsa = st.session_state[session_key]
 current_signers = st.session_state[signers_key]
 
-# --- UI Header & Editable First Page Status Card ---
+# --- UI Header & Lead Admin Section ---
 st.title("⚡ CPG QTS Safety Portal")
 
-with st.expander("✏️ Edit Header & Site Info (Active Site, Lead, Group)", expanded=False):
-    h_c1, h_c2, h_c3, h_c4 = st.columns(4)
-    with h_c1:
-        current_jsa['location'] = st.text_input("Active Site / Location", value=str(current_jsa.get('location', '')), key="hdr_loc")
-    with h_c2:
-        current_jsa['lead'] = st.text_input("Lead Name", value=str(current_jsa.get('lead', '')), key="hdr_lead")
-    with h_c3:
-        current_jsa['group_type'] = st.selectbox("Group / Specialty", options=["SWITCHGEAR", "POWER", "HVAC", "SOLAR", "GENERATOR"], index=0, key="hdr_group")
-    with h_c4:
-        current_jsa['role_title'] = st.text_input("Role Title", value=str(current_jsa.get('role_title', 'Level 4 EPS Lead')), key="hdr_role")
-    
-    if st.button("💾 Save Header Updates"):
-        save_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
-        st.success("Header updated and saved!")
+# Check if viewing via QR code / mobile sign mode
+is_mobile_signer = (query_params.get("action") == "sign")
+
+if is_mobile_signer:
+    st.info("📲 **Mobile Crew Sign-Off Mode Active** — You have opened the briefing sign-off portal. Review the scope in Tab 2 if needed and sign below.")
+else:
+    # Lead-Only Admin & New JSA Thumbnail Button Panel
+    lead_col1, lead_col2 = st.columns([3, 1])
+    with lead_col1:
+        with st.expander("✏️ Edit Header & Site Info (Active Site, Lead, Group)", expanded=False):
+            h_c1, h_c2, h_c3, h_c4 = st.columns(4)
+            with h_c1:
+                current_jsa['location'] = st.text_input("Active Site / Location", value=str(current_jsa.get('location', '')), key="hdr_loc")
+            with h_c2:
+                current_jsa['lead'] = st.text_input("Lead Name", value=str(current_jsa.get('lead', '')), key="hdr_lead")
+            with h_c3:
+                current_jsa['group_type'] = st.selectbox("Group / Specialty", options=["SWITCHGEAR", "POWER", "HVAC", "SOLAR", "GENERATOR"], index=0, key="hdr_group")
+            with h_c4:
+                current_jsa['role_title'] = st.text_input("Role Title", value=str(current_jsa.get('role_title', 'Level 4 EPS Lead')), key="hdr_role")
+            
+            if st.button("💾 Save Header Updates"):
+                save_persistent_state(current_jsa['lead'], current_jsa['location'], current_jsa, current_signers)
+                st.success("Header updated and saved!")
+    with lead_col2:
+        # Secure Lead Thumbnail Button to start a fresh JSA without affecting technicians
+        if st.button("➕ Create New JSA", help="Click to wipe previous signatures and start a fresh JSA for a new scope today"):
+            fresh_jsa, fresh_signers = load_persistent_state(current_jsa['lead'], current_jsa['location'], default_jsa_dict, default_signers_list, force_fresh=True)
+            st.session_state[session_key] = fresh_jsa
+            st.session_state[signers_key] = fresh_signers
+            st.success("Fresh JSA initialized!")
+            st.rerun()
 
 st.markdown(
     f'<div class="status-card"><b>Active Site:</b> {current_jsa.get("location", "")} &nbsp;|&nbsp; '
@@ -477,12 +502,12 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Feature 4: Render Dynamic Geocoded Weather Widget based on Active Site Location
+# Render Dynamic Weather Widget based on Active Site Location
 weather_info = fetch_dynamic_site_weather(current_jsa.get('location', 'Site'))
 st.markdown(f'<div class="weather-card">{weather_info}</div>', unsafe_allow_html=True)
 
-if query_params.get("action") == "sign":
-    st.info("📲 **Mobile Crew Sign-Off Mode Active** — You have opened the briefing sign-off portal. Review the scope in Tab 2 if needed and sign below.")
+# Smart Tab Selection: If scanned via QR code (?action=sign), automatically default to Tab 3 (Crew Sign)
+default_tab_index = 2 if is_mobile_signer else 0
 
 tab_brief, tab_review, tab_sign, tab_export = st.tabs(["🎙️ 1. Voice Briefing", "📝 2. Review JSA", "✍️ 3. QR / Crew Sign", "🚀 4. Drive Sync"])
 
